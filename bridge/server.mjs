@@ -22,7 +22,7 @@ import { uiServer } from './ui.mjs'
 import { chromeAvailable, chromeServer } from './chrome.mjs'
 import { visionServer } from './vision.mjs'
 import { homedir, tmpdir } from 'node:os'
-import { readFileSync, realpathSync } from 'node:fs'
+import { mkdirSync, readFileSync, realpathSync } from 'node:fs'
 import { readFile, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve as resolvePath } from 'node:path'
 import { openRemote, proxyError, vetTarget, PROXY_UA } from './net.mjs'
@@ -99,6 +99,44 @@ function originAllowed(origin) {
 const ALLOW_WRITES = process.env.JARVIS_ALLOW_WRITES === '1'
 
 /**
+ * Hardening (fork): JARVIS only sees one folder, not the whole home directory.
+ * Put anything you want him to read in ~/jarvis-workspace. Screenshots in the
+ * temp folders still work. Override with JARVIS_WORKSPACE.
+ */
+const WORKSPACE = resolvePath(
+  process.env.JARVIS_WORKSPACE ?? join(homedir(), 'jarvis-workspace'),
+)
+mkdirSync(WORKSPACE, { recursive: true })
+
+/**
+ * Hardening (fork): your logged-in Chrome is off unless you ask for it with
+ * JARVIS_CHROME=1. Reading Gmail and then opening a link is enough to leak it.
+ */
+const ALLOW_CHROME = process.env.JARVIS_CHROME === '1'
+
+const READABLE_ROOTS = [WORKSPACE, tmpdir(), '/tmp'].map((root) => {
+  try {
+    return realpathSync(root)
+  } catch {
+    return resolvePath(root)
+  }
+})
+
+function pathAllowed(p) {
+  if (!p) return true
+  let real
+  try {
+    real = realpathSync(resolvePath(WORKSPACE, p))
+  } catch {
+    real = resolvePath(WORKSPACE, p)
+  }
+  return READABLE_ROOTS.some((root) => {
+    const rel = relative(root, real)
+    return !rel.startsWith('..') && !isAbsolute(rel)
+  })
+}
+
+/**
  * The orchestrator model. Override with JARVIS_MODEL to trade quality for pace
  * — claude-sonnet-5 is noticeably snappier on camera if Opus feels slow.
  */
@@ -119,7 +157,7 @@ const MODEL = process.env.JARVIS_MODEL ?? 'claude-opus-5'
  * matters more than pace; drop back to 'low' when filming and every second of
  * dead air shows.
  */
-const EFFORT = process.env.JARVIS_EFFORT ?? 'high'
+const EFFORT = process.env.JARVIS_EFFORT ?? 'medium'
 
 /**
  * Both spellings of every renamed built-in are listed on purpose. The SDK
@@ -480,7 +518,7 @@ const IMAGE_TYPES = {
 const MAX_FILE_BYTES = 25 * 1024 * 1024
 
 const FILE_ROOTS = [
-  homedir(),
+  WORKSPACE,
   // Both temp directories, because on macOS os.tmpdir() is the per-user
   // $TMPDIR under /var/folders while half the tools that take a screenshot
   // still write it to /tmp. Dropping one of them loses real panels.
@@ -1013,7 +1051,9 @@ console.log(
 // at all because an extension that is simply not running is indistinguishable
 // at the tool boundary from one that is broken, and this is the one place the
 // difference can be stated before anybody asks a question that depends on it.
-void chromeAvailable().then((ok) => {
+if (!ALLOW_CHROME) console.log('[jarvis] browser control OFF — start with JARVIS_CHROME=1 to let JARVIS read your Chrome')
+console.log(`[jarvis] file access limited to ${WORKSPACE}`)
+if (ALLOW_CHROME) void chromeAvailable().then((ok) => {
   console.log(
     ok
       ? `[jarvis] browser control ready${ALLOW_WRITES ? '' : ' (reading only — clicking and typing need JARVIS_ALLOW_WRITES=1)'}`
@@ -1211,7 +1251,7 @@ wss.on('connection', (socket) => {
         // The user's own Chrome, over the extension's native-host socket. It
         // holds no per-connection state, but it is built here with the rest so
         // the write gate is read once, at the same point as everything else.
-        jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }),
+        ...(ALLOW_CHROME ? { jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }) } : {}),
         // The camera, which unlike everything else here has to ask and wait.
         jarvis_eyes: visionServer(ask),
       },
@@ -1222,7 +1262,7 @@ wss.on('connection', (socket) => {
       systemPrompt: SYSTEM_PROMPT,
       // Run from the home directory so project-scoped MCP servers don't shadow
       // the global ones, and so file tools have a sane root.
-      cwd: homedir(),
+      cwd: WORKSPACE,
       // No filesystem settings at all. Left to its default the SDK loads
       // ~/.claude/settings.json and settings.local.json exactly as the CLI
       // does — which on a working machine means a bypassPermissions default
@@ -1248,6 +1288,9 @@ wss.on('connection', (socket) => {
       effort: EFFORT,
       maxTurns: 24,
       permissionMode: 'default',
+      // Hardening (fork): no shell at all in read-only mode, so nothing can
+      // slip past the gate below.
+      disallowedTools: ALLOW_WRITES ? [] : ['Bash'],
       // Without this the SDK only emits whole assistant messages, and JARVIS
       // would sit silent until the entire answer was written. Partial events
       // are what let speech start on the first finished sentence.
@@ -1261,8 +1304,11 @@ wss.on('connection', (socket) => {
       // through a `Bash: echo hello` without asking, and only reaches us for
       // something with a consequence, like a `touch`. So a deny here is
       // reliable; an absence of a call here is not proof nothing ran.
-      canUseTool: async (toolName) => {
-        const ok = decideTool(toolName)
+      canUseTool: async (toolName, input) => {
+        const target = input?.file_path ?? input?.path ?? input?.notebook_path
+        const ok =
+          decideTool(toolName) &&
+          (ALLOW_WRITES || !['Read', 'Glob', 'Grep'].includes(toolName) || pathAllowed(target))
         console.log(`[jarvis] tool ${toolName} -> ${ok ? 'allow' : 'deny'}`)
         return ok
           ? { behavior: 'allow' }
